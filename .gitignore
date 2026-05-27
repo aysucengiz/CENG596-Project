@@ -1,0 +1,26 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+
+# Runtime outputs and caches
+runs/
+ir_datasets_cache/
+.pyterrier/
+*.npy
+*.pkl
+*.parquet
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Repo-local runtime caches
+runtime/bm25_index/
+runtime/prepared_cache/
+

@@ -1,0 +1,12 @@
+﻿faiss-cpu
+ir_datasets
+numpy
+pandas
+pyterrier
+pyterrier[java]
+sentence-transformers==3.0.1
+streamlit
+torch
+torch-directml
+tqdm
+transformers==4.41.2
