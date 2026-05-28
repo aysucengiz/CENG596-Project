@@ -5,6 +5,7 @@ import json
 import math
 import os
 import pickle
+import re
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ DOC_DATASET_ID = "clinicaltrials/2021"
 QUERY_DATASET_ID = "clinicaltrials/2021/trec-ct-2021"
 PROGRESS_CALLBACK = None
 BM25_BATCH_SIZE = 25
+RERANK_CACHE_VERSION = "structured_v1"
 
 
 def log_step(message: str) -> None:
@@ -147,11 +149,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reranker-model",
         type=str,
-        default="NeuML/biomedbert-base-reranker",
+        default="ncbi/MedCPT-Cross-Encoder",
         help="CrossEncoder model for reranking.",
     )
     parser.add_argument("--dense-batch-size", type=int, default=32)
-    parser.add_argument("--rerank-batch-size", type=int, default=16)
+    parser.add_argument("--rerank-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--rerank-alpha",
+        type=float,
+        default=None,
+        help="If set, fuse reranker score with retrieval score; retrieval score gets 1-alpha.",
+    )
     parser.add_argument(
         "--dense-device",
         type=str,
@@ -280,9 +288,83 @@ def build_dense_document_text_from_raw(raw_doc: dict[str, str], mode: str) -> st
     return " ".join([title, condition, summary, eligibility]).strip()
 
 
+def shorten(text: str | None, max_chars: int = 1200) -> str:
+    return text[:max_chars] if text else ""
+
+
+def extract_structured_eligibility(eligibility_text: Any, max_items: int = 4, max_chars: int = 1200) -> str:
+    if eligibility_text is None or pd.isna(eligibility_text):
+        return ""
+
+    eligibility_text = str(eligibility_text)
+    if not eligibility_text:
+        return ""
+
+    text_lower = eligibility_text.lower()
+    inc_idx = text_lower.find("inclusion criteria")
+    exc_idx = text_lower.find("exclusion criteria")
+
+    inclusion_raw = ""
+    exclusion_raw = ""
+
+    if inc_idx != -1 and exc_idx != -1:
+        if inc_idx < exc_idx:
+            inclusion_raw = eligibility_text[inc_idx:exc_idx]
+            exclusion_raw = eligibility_text[exc_idx:]
+        else:
+            exclusion_raw = eligibility_text[exc_idx:inc_idx]
+            inclusion_raw = eligibility_text[inc_idx:]
+    elif inc_idx != -1:
+        inclusion_raw = eligibility_text[inc_idx:]
+    elif exc_idx != -1:
+        exclusion_raw = eligibility_text[exc_idx:]
+    else:
+        return str(eligibility_text)[:max_chars]
+
+    def get_top_rules(text_block: str, block_label: str, items_count: int) -> str:
+        if not text_block:
+            return ""
+        lines = [line.strip() for line in re.split(r"\n|-|\u2022|\*", text_block) if len(line.strip()) > 10]
+        extracted_lines = lines[: items_count + 1]
+        return f"[{block_label}] " + " | ".join(extracted_lines)
+
+    inc_summary = get_top_rules(inclusion_raw, "INCLUSION", max_items)
+    exc_summary = get_top_rules(exclusion_raw, "EXCLUSION", max_items)
+
+    final_text = f"{inc_summary}  {exc_summary}".strip()
+    return final_text[:max_chars]
+
+
+def build_rerank_doc_text(raw_doc: dict[str, str]) -> str:
+    parts = []
+
+    if raw_doc.get("title"):
+        parts.append("Title: " + str(raw_doc["title"])[:200])
+
+    if raw_doc.get("condition"):
+        parts.append("Condition: " + str(raw_doc["condition"])[:200])
+
+    if raw_doc.get("eligibility"):
+        structured_eligibility = extract_structured_eligibility(raw_doc["eligibility"])
+        parts.append("Eligibility: " + structured_eligibility)
+
+    return " | ".join(parts).strip()
+
+
 def cache_suffix(max_docs: int | None, mode: str | None = None) -> str:
     base = "all" if max_docs is None else str(max_docs)
     return f"{base}_{mode}" if mode else base
+
+
+def safe_cache_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_")
+
+
+def minmax_normalize_by_query(df: pd.DataFrame, column: str) -> pd.Series:
+    min_score = df.groupby("qid")[column].transform("min")
+    max_score = df.groupby("qid")[column].transform("max")
+    denom = (max_score - min_score).replace(0, 1)
+    return ((df[column] - min_score) / denom).fillna(0.0)
 
 
 def get_docs_df(
@@ -822,24 +904,85 @@ def rerank_candidates(
     candidate_df: pd.DataFrame,
     queries_df: pd.DataFrame,
     docs_df: pd.DataFrame,
+    raw_docs: dict[str, dict[str, str]],
+    cache_path: Path,
     batch_size: int,
+    rerank_alpha: float | None,
 ) -> pd.DataFrame:
     log_step("Preparing candidate pairs for reranking")
     rerank_start = time.perf_counter()
     query_map = dict(zip(queries_df["qid"], queries_df["query"]))
-    doc_map = dict(zip(docs_df["docno"], docs_df["text"]))
+    fallback_doc_map = dict(zip(docs_df["docno"], docs_df["text"]))
+    doc_map = {
+        docno: build_rerank_doc_text(raw_doc) or fallback_doc_map.get(docno, "")
+        for docno, raw_doc in raw_docs.items()
+    }
 
     rerank_df = candidate_df.copy()
+    rerank_df["retrieval_score"] = pd.to_numeric(rerank_df["score"], errors="coerce").fillna(0.0)
     rerank_df["query_text"] = rerank_df["qid"].map(query_map).map(normalize_query_text)
     rerank_df["doc_text"] = rerank_df["docno"].map(doc_map)
     rerank_df = rerank_df.dropna(subset=["query_text", "doc_text"]).copy()
     log_info(f"Reranking will score {len(rerank_df)} query-document pairs")
 
-    pairs = list(zip(rerank_df["query_text"], rerank_df["doc_text"]))
-    log_step("Running cross-encoder reranking")
-    log_info(f"Sending {len(pairs)} query-document pairs to the reranker with batch_size={batch_size}")
-    rerank_scores = reranker.predict(pairs, batch_size=batch_size, show_progress_bar=True)
-    rerank_df["score"] = rerank_scores
+    cache_columns = ["qid", "docno", "rerank_score"]
+    if cache_path.exists():
+        log_step(f"Loading reranker score cache from {cache_path}")
+        try:
+            cache_df = pd.read_parquet(cache_path)
+            if not set(cache_columns).issubset(cache_df.columns):
+                log_info("Reranker cache is missing required columns; rebuilding cache entries")
+                cache_df = pd.DataFrame(columns=cache_columns)
+            else:
+                cache_df = cache_df[cache_columns].drop_duplicates(["qid", "docno"], keep="last")
+                log_info(f"Loaded {len(cache_df)} cached reranker scores")
+        except Exception as exc:
+            log_info(f"Could not load reranker cache ({exc}); rebuilding cache entries")
+            cache_df = pd.DataFrame(columns=cache_columns)
+    else:
+        cache_df = pd.DataFrame(columns=cache_columns)
+
+    rerank_df = rerank_df.merge(cache_df, on=["qid", "docno"], how="left")
+    missing_mask = rerank_df["rerank_score"].isna()
+    missing_count = int(missing_mask.sum())
+    cached_count = len(rerank_df) - missing_count
+    log_info(f"Reranker cache hits: {cached_count}; cache misses: {missing_count}")
+
+    if missing_count:
+        missing_df = rerank_df.loc[missing_mask].copy()
+        pairs = list(zip(missing_df["query_text"], missing_df["doc_text"]))
+        log_step("Running cross-encoder reranking for cache misses")
+        log_info(f"Sending {len(pairs)} query-document pairs to the reranker with batch_size={batch_size}")
+        rerank_scores = reranker.predict(pairs, batch_size=batch_size, show_progress_bar=True)
+        rerank_df.loc[missing_mask, "rerank_score"] = rerank_scores
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        updated_cache_df = pd.concat(
+            [cache_df, rerank_df[cache_columns]],
+            ignore_index=True,
+        ).drop_duplicates(["qid", "docno"], keep="last")
+        updated_cache_df.to_parquet(cache_path, index=False)
+        log_info(f"Saved {len(updated_cache_df)} reranker scores to cache")
+    else:
+        log_info("All reranker scores were loaded from cache")
+
+    rerank_df["rerank_score"] = pd.to_numeric(rerank_df["rerank_score"], errors="coerce").fillna(0.0)
+    if rerank_alpha is None:
+        rerank_df["score"] = rerank_df["rerank_score"]
+        log_info("Final rerank score uses reranker score only")
+    else:
+        rerank_alpha = max(0.0, min(1.0, rerank_alpha))
+        retrieval_alpha = 1.0 - rerank_alpha
+        rerank_df["retrieval_score_norm"] = minmax_normalize_by_query(rerank_df, "retrieval_score")
+        rerank_df["rerank_score_norm"] = minmax_normalize_by_query(rerank_df, "rerank_score")
+        rerank_df["score"] = (
+            rerank_alpha * rerank_df["rerank_score_norm"]
+            + retrieval_alpha * rerank_df["retrieval_score_norm"]
+        )
+        log_info(
+            f"Final rerank score uses reranker weight={rerank_alpha:.2f} "
+            f"and retrieval weight={retrieval_alpha:.2f}"
+        )
     rerank_df = rerank_df.sort_values(["qid", "score"], ascending=[True, False]).copy()
     rerank_df["rank"] = rerank_df.groupby("qid").cumcount() + 1
     rerank_df = rerank_df.reset_index(drop=True)
@@ -1014,15 +1157,20 @@ def main() -> None:
         candidate_df = fused_results_df
 
     if not args.skip_rerank:
+        safe_reranker_name = safe_cache_name(args.reranker_model)
+        rerank_cache_path = output_dir / f"rerank_scores_{safe_reranker_name}_{RERANK_CACHE_VERSION}.parquet"
         with progress.stage("Load reranker", args.reranker_model):
             reranker = load_reranker(args.reranker_model, device=rerank_device)
-        with progress.stage("Run reranking", f"batch_size={args.rerank_batch_size}"):
+        with progress.stage("Run reranking", f"batch_size={args.rerank_batch_size}, cache={rerank_cache_path.name}"):
             reranked_df = rerank_candidates(
                 reranker,
                 candidate_df,
                 queries_df,
                 docs_df,
+                raw_docs,
+                rerank_cache_path,
                 batch_size=args.rerank_batch_size,
+                rerank_alpha=args.rerank_alpha,
             )
             reranked_df = reranked_df[reranked_df["rank"] <= args.top_k].copy()
         write_run(reranked_df, output_dir / "reranked_run.txt", "crossencoder_rerank")
