@@ -11,9 +11,14 @@ import streamlit as st
 import clinical_trials_local_pipeline as backend
 
 
-APP_OUTPUT_DIR = RUNTIME_ROOT
-EMBEDDING_CACHE_DIR = RUNTIME_ROOT / "embeddings"
-PREPARED_CACHE_DIR = RUNTIME_ROOT / "prepared_cache"
+RERANKER_MODEL = "ncbi/MedCPT-Cross-Encoder"
+APP_OUTPUT_DIR = backend.RUNTIME_ROOT
+EMBEDDING_CACHE_DIR = backend.RUNTIME_ROOT / "embeddings"
+PREPARED_CACHE_DIR = backend.RUNTIME_ROOT / "prepared_cache"
+RERANK_CACHE_PATH = (
+    APP_OUTPUT_DIR
+    / f"rerank_scores_{backend.safe_cache_name(RERANKER_MODEL)}_{backend.RERANK_CACHE_VERSION}.parquet"
+)
 
 
 def render_active_stage(active_stage_box: Any, stage_name: str, detail: str | None = None) -> None:
@@ -232,7 +237,7 @@ def load_dense_resources(
 
 @st.cache_resource(show_spinner=False)
 def load_reranker(rerank_device: str) -> Any:
-    return backend.load_reranker("NeuML/biomedbert-base-reranker", rerank_device)
+    return backend.load_reranker(RERANKER_MODEL, rerank_device)
 
 
 def search_bm25(index_ref: Any, query_text: str, top_k: int) -> pd.DataFrame:
@@ -322,6 +327,7 @@ def search_reranked(
     candidate_df: pd.DataFrame,
     reranker: Any,
     docs_df: pd.DataFrame,
+    raw_docs: dict[str, dict[str, str]],
     query_text: str,
     top_k: int,
 ) -> pd.DataFrame:
@@ -331,7 +337,10 @@ def search_reranked(
         candidate_df,
         query_df,
         docs_df,
+        raw_docs,
+        RERANK_CACHE_PATH,
         batch_size=8,
+        rerank_alpha=None,
     )
     return reranked[reranked["rank"] <= top_k].copy()
 
@@ -398,7 +407,10 @@ def run_full_evaluation(
             final_results,
             queries_df,
             bm25_resources["docs_df"],
+            bm25_resources["raw_docs"],
+            RERANK_CACHE_PATH,
             batch_size=8,
+            rerank_alpha=None,
         )
         final_results = final_results[final_results["rank"] <= top_k].copy()
         evaluate_named_run("Reranked", final_results)
@@ -606,6 +618,7 @@ if run_search:
                 fused_results,
                 reranker,
                 bm25_resources["docs_df"],
+                bm25_resources["raw_docs"],
                 query_text,
                 top_k=top_k,
             )

@@ -157,8 +157,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rerank-alpha",
         type=float,
-        default=None,
-        help="If set, fuse reranker score with retrieval score; retrieval score gets 1-alpha.",
+        default=0.8,
+        help="Fuse reranker score with retrieval score; retrieval score gets 1-alpha.",
     )
     parser.add_argument(
         "--dense-device",
