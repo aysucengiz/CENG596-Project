@@ -21,6 +21,5 @@ Thumbs.db
 .idea/
 
 # Repo-local runtime caches
-runtime/bm25_index/
-runtime/prepared_cache/
+runtime/
 
