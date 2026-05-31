@@ -917,8 +917,24 @@ def tune_weighted_rrf(
     top_k: int,
 ) -> tuple[pd.DataFrame, dict[str, float], pd.DataFrame]:
     log_step("Tuning weighted RRF fusion")
-    rrf_k_values = [10, 30, 60]
-    alpha_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    rrf_k_values = [1, 3, 5, 10, 15, 20, 30, 45, 60, 100, 200]
+    alpha_values = [
+        0.0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.82,
+        0.84,
+        0.86,
+        0.88,
+        0.9,
+        1.0,
+    ]
     total_trials = len(rrf_k_values) * len(alpha_values)
     tune_start = time.perf_counter()
     log_info(f"Running {total_trials} weighted RRF trials")

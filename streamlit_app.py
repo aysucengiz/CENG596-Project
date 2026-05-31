@@ -354,11 +354,20 @@ def run_full_evaluation(
     alpha_bm25: float,
     tune_rrf: bool,
     reranker: Any | None,
-) -> tuple[pd.DataFrame, dict[str, dict[str, dict[str, float]]]]:
+) -> tuple[pd.DataFrame, dict[str, dict[str, dict[str, float]]], dict[str, Any]]:
     queries_df = bm25_resources["queries_df"]
     qrels = bm25_resources["qrels"]
     thresholded_qrels = backend.build_thresholded_qrels(qrels)
     metrics_by_name: dict[str, dict[str, dict[str, float]]] = {}
+    run_info: dict[str, Any] = {
+        "retrieval_mode": retrieval_mode,
+        "top_k": top_k,
+        "tune_rrf": tune_rrf,
+        "rrf_k": rrf_k,
+        "alpha_bm25": alpha_bm25,
+        "alpha_dense": 1.0 - alpha_bm25,
+        "rrf_source": "manual",
+    }
 
     def evaluate_named_run(name: str, results_df: pd.DataFrame) -> None:
         metrics_by_name[name] = {
@@ -385,11 +394,21 @@ def run_full_evaluation(
 
     if retrieval_mode in {"Fused", "Reranked"} and dense_results is not None:
         if tune_rrf:
-            final_results, _, _ = backend.tune_weighted_rrf(
+            final_results, best_trial, _ = backend.tune_weighted_rrf(
                 bm25_results,
                 dense_results,
                 thresholded_qrels["rel>=1"],
                 top_k,
+            )
+            run_info.update(
+                {
+                    "rrf_k": int(best_trial["rrf_k"]),
+                    "alpha_bm25": float(best_trial["alpha_bm25"]),
+                    "alpha_dense": float(best_trial["alpha_dense"]),
+                    "rrf_source": "tuned rel>=1 MRR",
+                    "rrf_tuned_mrr": float(best_trial["MRR"]),
+                    "rrf_tuned_map": float(best_trial["MAP"]),
+                }
             )
         else:
             final_results = search_fused(
@@ -415,7 +434,7 @@ def run_full_evaluation(
         final_results = final_results[final_results["rank"] <= top_k].copy()
         evaluate_named_run("Reranked", final_results)
 
-    return final_results, metrics_by_name
+    return final_results, metrics_by_name, run_info
 
 
 def metrics_to_table(metrics_by_name: dict[str, dict[str, dict[str, float]]]) -> pd.DataFrame:
@@ -715,7 +734,7 @@ if run_evaluation:
         update_progress(progress_bar, status_box, min(95, int(((completed_stages[0] + 0.5) / len(stage_plan)) * 100)), f"{completed_stages[0]}/{len(stage_plan)} - Running evaluation")
         details_box.caption(f"Evaluating mode: {retrieval_mode}")
         render_active_stage(active_stage_box, "Running evaluation", f"mode={retrieval_mode}, top_k={top_k}")
-        _, eval_metrics = run_full_evaluation(
+        _, eval_metrics, eval_run_info = run_full_evaluation(
             retrieval_mode=retrieval_mode,
             top_k=top_k,
             bm25_resources=bm25_resources,
@@ -739,10 +758,18 @@ if run_evaluation:
     eval_table = metrics_to_table(eval_metrics)
     available_systems = ", ".join(eval_table["system"].drop_duplicates().tolist())
     st.caption(f"Included systems: {available_systems}")
-    st.caption(
-        f"Parameters used: top_k={top_k}, rrf_k={rrf_k}, alpha_bm25={alpha_bm25:.1f}, "
-        f"alpha_dense={1.0 - alpha_bm25:.1f}, tune_rrf={tune_rrf}"
-    )
+
+    st.markdown("**Run settings**")
+    settings_cols = st.columns(3)
+    settings_cols[0].metric("Mode", eval_run_info["retrieval_mode"])
+    settings_cols[1].metric("Top-k", eval_run_info["top_k"])
+    if eval_run_info["retrieval_mode"] in {"Fused", "Reranked"}:
+        settings_cols[2].metric("RRF k", eval_run_info["rrf_k"])
+        st.caption(f"alpha_bm25={eval_run_info['alpha_bm25']:.2f}")
+        st.caption(f"alpha_dense={eval_run_info['alpha_dense']:.2f}")
+    else:
+        settings_cols[2].metric("Fusion", "Not used")
+
     st.dataframe(
         eval_table,
         use_container_width=True,
