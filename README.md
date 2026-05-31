@@ -34,7 +34,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Set `JAVA_HOME` to your JDK 17 installation and add `%JAVA_HOME%\bin` to `Path`. Or add it in the environment manually:
 ```powershell
  $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"                       
->> $env:Path = "$env:JAVA_HOME\bin;$env:Path"
+$env:Path = "$env:JAVA_HOME\bin;$env:Path"
 ```
 
 ## Run the Streamlit app

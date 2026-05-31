@@ -6,6 +6,7 @@ import math
 import os
 import pickle
 import re
+import shutil
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -28,7 +29,7 @@ DOC_DATASET_ID = "clinicaltrials/2021"
 QUERY_DATASET_ID = "clinicaltrials/2021/trec-ct-2021"
 PROGRESS_CALLBACK = None
 BM25_BATCH_SIZE = 25
-RERANK_CACHE_VERSION = "structured_v1"
+RERANK_CACHE_VERSION = "structured_summary_v2"
 
 
 def log_step(message: str) -> None:
@@ -344,6 +345,9 @@ def build_rerank_doc_text(raw_doc: dict[str, str]) -> str:
     if raw_doc.get("condition"):
         parts.append("Condition: " + str(raw_doc["condition"])[:200])
 
+    if raw_doc.get("summary"):
+        parts.append("Summary: " + shorten(str(raw_doc["summary"]), 700))
+
     if raw_doc.get("eligibility"):
         structured_eligibility = extract_structured_eligibility(raw_doc["eligibility"])
         parts.append("Eligibility: " + structured_eligibility)
@@ -597,19 +601,65 @@ def print_metrics_summary(metrics_by_name: dict[str, dict[str, dict[str, float]]
             tqdm.write(" ".join(f"{value:<{width}}" for value, width in zip(row, widths)))
 
 
+def get_index_doc_count(index_ref: Any) -> int:
+    if not hasattr(index_ref, "getCollectionStatistics"):
+        index_ref = pt.IndexFactory.of(index_ref)
+    return int(index_ref.getCollectionStatistics().getNumberOfDocuments())
+
+
+def iter_bm25_index_records(docs_df: pd.DataFrame):
+    total_docs = len(docs_df)
+    progress_interval = max(1, total_docs // 100)
+    last_percent = -1
+    rows = docs_df[["docno", "text"]].itertuples(index=False)
+
+    with tqdm(total=total_docs, desc="Indexing BM25 docs", unit="doc") as progress_bar:
+        for idx, row in enumerate(rows, start=1):
+            progress_bar.update(1)
+            if PROGRESS_CALLBACK is not None and (idx == 1 or idx % progress_interval == 0 or idx == total_docs):
+                percent = int((idx / total_docs) * 100)
+                if percent != last_percent:
+                    PROGRESS_CALLBACK(
+                        percent,
+                        "Indexing BM25 documents",
+                        f"{idx:,}/{total_docs:,} documents passed to Terrier",
+                    )
+                    last_percent = percent
+            yield {"docno": str(row.docno), "text": str(row.text or "")}
+
+
 def build_bm25_index(docs_df: pd.DataFrame, index_dir: Path, rebuild: bool) -> Any:
     data_properties = index_dir / "data.properties"
+    expected_doc_count = len(docs_df)
     if data_properties.exists() and not rebuild:
         log_step(f"Reusing existing BM25 index at {index_dir}")
         index_ref = pt.IndexFactory.of(str(index_dir))
-        log_info("Loaded existing BM25 index from disk")
+        actual_doc_count = get_index_doc_count(index_ref)
+        if actual_doc_count != expected_doc_count:
+            raise RuntimeError(
+                "Existing BM25 index document count does not match the prepared corpus. "
+                f"Index has {actual_doc_count} documents, but prepared corpus has {expected_doc_count}. "
+                "Run again with --rebuild-index."
+            )
+        log_info(f"Loaded existing BM25 index from disk with {actual_doc_count} documents")
         return index_ref
 
     log_step(f"Building BM25 index at {index_dir}")
+    if rebuild and index_dir.exists():
+        log_info("Removing existing BM25 index directory before rebuild")
+        shutil.rmtree(index_dir)
     index_dir.mkdir(parents=True, exist_ok=True)
-    indexer = pt.DFIndexer(str(index_dir), overwrite=True)
-    index_ref = indexer.index(docs_df["text"], docs_df["docno"])
-    log_info("BM25 index construction completed")
+    log_info(f"Starting Terrier indexing for {expected_doc_count:,} documents")
+    indexer = pt.terrier.IterDictIndexer(str(index_dir), overwrite=True, meta={"docno": 32})
+    index_ref = indexer.index(iter_bm25_index_records(docs_df))
+    index_ref = pt.IndexFactory.of(index_ref)
+    actual_doc_count = get_index_doc_count(index_ref)
+    if actual_doc_count != expected_doc_count:
+        raise RuntimeError(
+            "BM25 index construction finished with the wrong document count. "
+            f"Index has {actual_doc_count} documents, but expected {expected_doc_count}."
+        )
+    log_info(f"BM25 index construction completed with {actual_doc_count} documents")
     return index_ref
 
 
@@ -830,6 +880,36 @@ def fuse_weighted_rrf(
     return fused_df[fused_df["rank"] <= top_k].reset_index(drop=True)
 
 
+def build_union_candidates(
+    bm25_df: pd.DataFrame,
+    dense_df: pd.DataFrame,
+    fused_df: pd.DataFrame,
+    top_k: int,
+) -> pd.DataFrame:
+    log_step("Building BM25+dense union candidate pool for reranking")
+    bm25_pool = bm25_df[bm25_df["rank"] <= top_k][["qid", "docno", "score", "rank"]].copy()
+    dense_pool = dense_df[dense_df["rank"] <= top_k][["qid", "docno", "score", "rank"]].copy()
+    fused_pool = fused_df[fused_df["rank"] <= top_k][["qid", "docno", "score", "rank"]].copy()
+
+    bm25_pool = bm25_pool.rename(columns={"score": "bm25_score", "rank": "bm25_rank"})
+    dense_pool = dense_pool.rename(columns={"score": "dense_score", "rank": "dense_rank"})
+    fused_pool = fused_pool.rename(columns={"score": "fused_score", "rank": "fused_rank"})
+
+    candidate_pool = bm25_pool.merge(dense_pool, on=["qid", "docno"], how="outer")
+    candidate_pool = candidate_pool.merge(fused_pool, on=["qid", "docno"], how="outer")
+    candidate_pool["bm25_score_norm"] = minmax_normalize_by_query(candidate_pool, "bm25_score")
+    candidate_pool["dense_score_norm"] = minmax_normalize_by_query(candidate_pool, "dense_score")
+    candidate_pool["fused_score_norm"] = minmax_normalize_by_query(candidate_pool, "fused_score")
+    candidate_pool["score"] = candidate_pool[
+        ["fused_score_norm", "dense_score_norm", "bm25_score_norm"]
+    ].max(axis=1)
+    candidate_pool = candidate_pool.sort_values(["qid", "score"], ascending=[True, False]).copy()
+    candidate_pool["rank"] = candidate_pool.groupby("qid").cumcount() + 1
+    candidate_pool = candidate_pool[candidate_pool["rank"] <= top_k].reset_index(drop=True)
+    log_info(f"Union candidate pool contains {len(candidate_pool)} rows")
+    return candidate_pool[["qid", "docno", "score", "rank"]]
+
+
 def tune_weighted_rrf(
     bm25_df: pd.DataFrame,
     dense_df: pd.DataFrame,
@@ -837,8 +917,8 @@ def tune_weighted_rrf(
     top_k: int,
 ) -> tuple[pd.DataFrame, dict[str, float], pd.DataFrame]:
     log_step("Tuning weighted RRF fusion")
-    rrf_k_values = [10, 30, 60, 100]
-    alpha_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+    rrf_k_values = [10, 30, 60]
+    alpha_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     total_trials = len(rrf_k_values) * len(alpha_values)
     tune_start = time.perf_counter()
     log_info(f"Running {total_trials} weighted RRF trials")
@@ -1154,7 +1234,12 @@ def main() -> None:
         metrics_by_name["fused_rrf"] = {"rel>=1": fused_rel1, "rel>=2": fused_rel2}
         print_metrics("Fused RRF (rel>=1)", fused_rel1)
         print_metrics("Fused RRF (rel>=2)", fused_rel2)
-        candidate_df = fused_results_df
+        candidate_df = build_union_candidates(
+            bm25_results_df,
+            dense_results_df,
+            fused_results_df,
+            args.top_k,
+        )
 
     if not args.skip_rerank:
         safe_reranker_name = safe_cache_name(args.reranker_model)
