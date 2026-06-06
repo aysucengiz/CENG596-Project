@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import time
 from typing import Any
@@ -15,6 +16,7 @@ RERANKER_MODEL = "ncbi/MedCPT-Cross-Encoder"
 APP_OUTPUT_DIR = backend.RUNTIME_ROOT
 EMBEDDING_CACHE_DIR = backend.RUNTIME_ROOT / "embeddings"
 PREPARED_CACHE_DIR = backend.RUNTIME_ROOT / "prepared_cache"
+MODEL_CACHE_DIR = backend.DEFAULT_HF_CACHE_DIR
 RERANK_CACHE_PATH = (
     APP_OUTPUT_DIR
     / f"rerank_scores_{backend.safe_cache_name(RERANKER_MODEL)}_{backend.RERANK_CACHE_VERSION}.parquet"
@@ -26,19 +28,47 @@ def render_active_stage(active_stage_box: Any, stage_name: str, detail: str | No
     active_stage_box.markdown(
         f"""
         <style>
+        :root {{
+            --stage-bg-a: rgba(236, 253, 245, 0.98);
+            --stage-bg-b: rgba(240, 249, 255, 0.98);
+            --stage-orb: rgba(20, 184, 166, 0.18);
+            --stage-border: rgba(20, 184, 166, 0.42);
+            --stage-accent: #0f766e;
+            --stage-title: #134e4a;
+            --stage-text: #334155;
+            --stage-shadow: rgba(15, 23, 42, 0.1);
+        }}
+        @media (prefers-color-scheme: dark) {{
+            :root {{
+                --stage-bg-a: rgba(15, 23, 42, 0.92);
+                --stage-bg-b: rgba(19, 78, 74, 0.72);
+                --stage-orb: rgba(45, 212, 191, 0.22);
+                --stage-border: rgba(94, 234, 212, 0.38);
+                --stage-accent: #2dd4bf;
+                --stage-title: #ccfbf1;
+                --stage-text: #cbd5e1;
+                --stage-shadow: rgba(0, 0, 0, 0.35);
+            }}
+        }}
         .live-stage {{
-            padding: 0.85rem 1rem;
-            border-radius: 0.75rem;
-            background: rgba(59, 130, 246, 0.12);
-            border: 1px solid rgba(59, 130, 246, 0.28);
-            color: rgb(8, 51, 97);
+            padding: 0.95rem 1rem;
+            border-radius: 0.9rem;
+            background:
+                radial-gradient(circle at top left, var(--stage-orb), transparent 44%),
+                linear-gradient(135deg, var(--stage-bg-a), var(--stage-bg-b));
+            border: 1px solid var(--stage-border);
+            border-left: 5px solid var(--stage-accent);
+            color: var(--stage-text);
             margin-bottom: 0.5rem;
+            box-shadow: 0 12px 30px var(--stage-shadow);
         }}
         .live-stage-title {{
-            font-weight: 600;
+            font-weight: 800;
             display: flex;
             align-items: center;
             gap: 0.15rem;
+            color: var(--stage-title);
+            letter-spacing: 0.01em;
         }}
         .live-stage-title .dot {{
             animation: pulseDot 1.2s infinite;
@@ -55,7 +85,8 @@ def render_active_stage(active_stage_box: Any, stage_name: str, detail: str | No
         .stage-detail {{
             margin-top: 0.35rem;
             font-size: 0.92rem;
-            color: rgba(8, 51, 97, 0.85);
+            color: var(--stage-text);
+            line-height: 1.4;
         }}
         @keyframes pulseDot {{
             0%, 20% {{ opacity: 0.2; }}
@@ -82,9 +113,57 @@ def clear_active_stage(active_stage_box: Any) -> None:
 
 
 def render_status(status_box: Any, title: str, detail: str | None = None) -> None:
-    detail_text = detail or ""
+    detail_html = f"<div class='status-detail'>{detail}</div>" if detail else ""
     status_box.markdown(
-        f"**{title}**\n\n{detail_text}"
+        f"""
+        <div class="status-card">
+            <div class="status-title">{title}</div>
+            {detail_html}
+        </div>
+        <style>
+        :root {{
+            --status-bg-a: #fff7ed;
+            --status-bg-b: #fefce8;
+            --status-border: #fed7aa;
+            --status-accent: #f97316;
+            --status-title: #7c2d12;
+            --status-text: #475569;
+            --status-shadow: rgba(124, 45, 18, 0.09);
+        }}
+        @media (prefers-color-scheme: dark) {{
+            :root {{
+                --status-bg-a: rgba(30, 41, 59, 0.94);
+                --status-bg-b: rgba(67, 56, 202, 0.34);
+                --status-border: rgba(129, 140, 248, 0.42);
+                --status-accent: #818cf8;
+                --status-title: #e0e7ff;
+                --status-text: #cbd5e1;
+                --status-shadow: rgba(0, 0, 0, 0.32);
+            }}
+        }}
+        .status-card {{
+            padding: 0.75rem 0.9rem;
+            border-radius: 0.8rem;
+            background: linear-gradient(135deg, var(--status-bg-a), var(--status-bg-b));
+            border: 1px solid var(--status-border);
+            border-left: 4px solid var(--status-accent);
+            color: var(--status-text);
+            margin: 0.35rem 0;
+            box-shadow: 0 8px 20px var(--status-shadow);
+        }}
+        .status-title {{
+            font-weight: 800;
+            color: var(--status-title);
+        }}
+        .status-detail {{
+            margin-top: 0.25rem;
+            color: var(--status-text);
+            font-size: 0.92rem;
+            line-height: 1.4;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
 
@@ -118,23 +197,23 @@ def format_elapsed(seconds: float) -> str:
 
 def build_search_stage_list(retrieval_mode: str, tune_rrf: bool, selected_qid: str | None) -> list[str]:
     stages = [
-        "Load BM25 resources",
-        "Run BM25 retrieval",
+        "BM25 preparation",
+        "BM25 ranking",
     ]
     if retrieval_mode in {"Dense", "Fused", "Reranked"}:
         stages.extend(
             [
-                "Load dense resources",
-                "Run dense retrieval",
+                "Dense preparation",
+                "Dense ranking",
             ]
         )
     if retrieval_mode in {"Fused", "Reranked"}:
-        stages.append("Tune weighted RRF" if tune_rrf and selected_qid is not None else "Fuse results")
+        stages.append("Fusing")
     if retrieval_mode == "Reranked":
         stages.extend(
             [
-                "Load reranker",
-                "Run reranking",
+                "Reranking preparation",
+                "Reranking",
             ]
         )
     stages.append("Finalize results")
@@ -142,15 +221,14 @@ def build_search_stage_list(retrieval_mode: str, tune_rrf: bool, selected_qid: s
 
 
 def build_evaluation_stage_list(retrieval_mode: str, tune_rrf: bool) -> list[str]:
-    stages = ["Load BM25 resources"]
+    stages = ["BM25 preparation", "BM25 ranking"]
     if retrieval_mode in {"Dense", "Fused", "Reranked"}:
-        stages.append("Load dense resources")
+        stages.extend(["Dense preparation", "Dense ranking"])
+    if retrieval_mode in {"Fused", "Reranked"}:
+        stages.append("Fusing")
     if retrieval_mode == "Reranked":
-        stages.append("Load reranker")
-    if retrieval_mode in {"Fused", "Reranked"} and tune_rrf:
-        stages.append("Tune weighted RRF")
-    stages.append("Run evaluation")
-    stages.append("Finalize metrics")
+        stages.extend(["Reranking preparation", "Reranking"])
+    stages.append("Evaluations")
     return stages
 
 
@@ -170,6 +248,70 @@ def enrich_results(results_df: pd.DataFrame, raw_docs: dict[str, dict[str, str]]
             }
         )
     return pd.DataFrame(rows)
+
+
+def enrich_results_with_relevance(
+    results_df: pd.DataFrame,
+    raw_docs: dict[str, dict[str, str]],
+    relevance_by_docno: dict[str, int],
+    top_n: int = 10,
+) -> pd.DataFrame:
+    enriched = enrich_results(results_df.sort_values("rank").head(top_n), raw_docs)
+    if enriched.empty:
+        return enriched
+    enriched["relevance"] = enriched["docno"].map(relevance_by_docno).fillna(0).astype(int)
+    enriched["relevance_label"] = enriched["relevance"].map(
+        {
+            0: "0 - not judged/not relevant",
+            1: "1 - relevant",
+            2: "2 - highly relevant",
+        }
+    ).fillna(enriched["relevance"].astype(str))
+    return enriched[
+        [
+            "rank",
+            "docno",
+            "relevance",
+            "relevance_label",
+            "score",
+            "title",
+            "condition",
+            "summary_snippet",
+        ]
+    ]
+
+
+def render_step_rankings(
+    step_results: dict[str, pd.DataFrame],
+    raw_docs: dict[str, dict[str, str]],
+    relevance_by_docno: dict[str, int],
+) -> None:
+    if not step_results:
+        return
+
+    st.subheader("Top 10 Rankings by Step")
+    st.caption("Relevance is taken from the TREC qrels for the selected query.")
+    tabs = st.tabs(list(step_results.keys()))
+    for tab, (step_name, results_df) in zip(tabs, step_results.items()):
+        with tab:
+            step_df = enrich_results_with_relevance(results_df, raw_docs, relevance_by_docno, top_n=10)
+            relevant_count = int((step_df["relevance"] > 0).sum()) if not step_df.empty else 0
+            highly_relevant_count = int((step_df["relevance"] >= 2).sum()) if not step_df.empty else 0
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("Shown", len(step_df))
+            col_b.metric("Relevant", relevant_count)
+            col_c.metric("Highly relevant", highly_relevant_count)
+            st.dataframe(
+                step_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "score": st.column_config.NumberColumn(format="%.4f"),
+                    "relevance": st.column_config.NumberColumn("qrel"),
+                    "relevance_label": st.column_config.TextColumn("relevance meaning"),
+                    "summary_snippet": st.column_config.TextColumn("summary"),
+                },
+            )
 
 
 @st.cache_resource(show_spinner=False)
@@ -193,6 +335,16 @@ def load_bm25_resources(max_docs: int | None, rebuild_index: bool) -> dict[str, 
 
 
 @st.cache_resource(show_spinner=False)
+def load_bm25_retriever(_index_ref: Any, top_k: int, corpus_key: str) -> Any:
+    return backend.pt.BatchRetrieve(
+        _index_ref,
+        wmodel="BM25",
+        controls={"bm25.k_1": 1.5, "bm25.b": 0.75},
+        num_results=top_k,
+    )
+
+
+@st.cache_resource(show_spinner=False)
 def load_query_resources() -> dict[str, Any]:
     queries_df, qrels = backend.load_queries_and_qrels()
     return {
@@ -204,19 +356,26 @@ def load_query_resources() -> dict[str, Any]:
 @st.cache_resource(show_spinner=False)
 def load_dense_resources(
     max_docs: int | None,
+    rebuild_index: bool,
     dense_text_mode: str,
     dense_device: str,
     dense_batch_size: int,
-    raw_docs: dict[str, dict[str, str]],
+    model_offline: bool,
 ) -> dict[str, Any]:
+    bm25_resources = load_bm25_resources(max_docs, rebuild_index)
     dense_doc_df = backend.get_dense_docs_df(
         max_docs,
         mode=dense_text_mode,
         cache_dir=PREPARED_CACHE_DIR,
         rebuild_prepared=False,
-        raw_docs=raw_docs,
+        raw_docs=bm25_resources["raw_docs"],
     )
-    dense_model = backend.load_dense_model("NeuML/pubmedbert-base-embeddings", dense_device)
+    dense_model = backend.load_dense_model(
+        "NeuML/pubmedbert-base-embeddings",
+        dense_device,
+        cache_dir=MODEL_CACHE_DIR,
+        offline=model_offline,
+    )
     doc_embeddings, dense_docnos = backend.get_dense_embeddings(
         dense_model,
         dense_doc_df,
@@ -236,13 +395,20 @@ def load_dense_resources(
 
 
 @st.cache_resource(show_spinner=False)
-def load_reranker(rerank_device: str) -> Any:
-    return backend.load_reranker(RERANKER_MODEL, rerank_device)
+def load_reranker(rerank_device: str, model_offline: bool) -> Any:
+    return backend.load_reranker(
+        RERANKER_MODEL,
+        rerank_device,
+        cache_dir=MODEL_CACHE_DIR,
+        offline=model_offline,
+    )
 
 
-def search_bm25(index_ref: Any, query_text: str, top_k: int) -> pd.DataFrame:
+def search_bm25(bm25_retriever: Any, query_text: str) -> pd.DataFrame:
     query_df = pd.DataFrame([{"qid": "user_query", "query": query_text}])
-    return backend.run_bm25(index_ref, query_df, top_k)
+    query_df["query"] = query_df["query"].apply(backend.normalize_query_text)
+    results_df = bm25_retriever.transform(query_df)
+    return results_df.sort_values(["qid", "rank"]).reset_index(drop=True)
 
 
 def search_dense(
@@ -330,8 +496,11 @@ def search_reranked(
     raw_docs: dict[str, dict[str, str]],
     query_text: str,
     top_k: int,
+    query_id: str,
 ) -> pd.DataFrame:
-    query_df = pd.DataFrame([{"qid": "user_query", "query": query_text}])
+    query_df = pd.DataFrame([{"qid": query_id, "query": query_text}])
+    candidate_df = candidate_df.copy()
+    candidate_df["qid"] = query_id
     reranked = backend.rerank_candidates(
         reranker,
         candidate_df,
@@ -463,6 +632,13 @@ def update_progress(progress_bar: Any, status_box: Any, value: int, message: str
     render_status(status_box, message)
 
 
+def log_app_init(message: str, status_box: Any | None = None) -> None:
+    console_message = f"[app init] {message}"
+    print(console_message, flush=True)
+    if status_box is not None:
+        status_box.write(message)
+
+
 st.set_page_config(page_title="Clinical Trial Search", layout="wide")
 st.title("Clinical Trial Search")
 st.caption("BM25, dense retrieval, fusion, and reranking over the TREC Clinical Trials collection.")
@@ -485,12 +661,56 @@ with st.sidebar:
     dense_text_mode = st.selectbox("Dense text mode", ["short", "full"], index=0)
     dense_device = st.text_input("Dense device", value="cpu")
     rerank_device = st.text_input("Reranker device", value="cpu")
+    model_offline = st.checkbox("Use cached models only", value=False)
     rrf_k = st.number_input("RRF k", min_value=1, max_value=500, value=60, step=1)
     alpha_bm25 = st.slider("BM25 fusion weight", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
     tune_rrf = st.checkbox("Tune RRF (existing TREC query only)", value=False)
 
-with st.spinner("Loading query list..."):
-    query_loader_resources = load_query_resources()
+with st.status("Initializing backend resources...", expanded=True) as init_status:
+    log_app_init("Loading BM25 documents, qrels, and BM25 index.", init_status)
+    preloaded_bm25_resources = load_bm25_resources(max_docs=max_docs, rebuild_index=rebuild_index)
+    log_app_init(
+        f"BM25 resources ready: {len(preloaded_bm25_resources['docs_df'])} documents loaded.",
+        init_status,
+    )
+
+    log_app_init(f"Preparing cached BM25 retriever for top_k={top_k}.", init_status)
+    preloaded_bm25_retriever = load_bm25_retriever(
+        preloaded_bm25_resources["index_ref"],
+        top_k,
+        corpus_key=f"{max_docs_choice}|rebuild={rebuild_index}",
+    )
+    log_app_init("BM25 retriever ready.", init_status)
+
+    preloaded_dense_resources = None
+    if retrieval_mode in {"Dense", "Fused", "Reranked"}:
+        log_app_init(
+            "Loading dense model, dense document embeddings, and FAISS index.",
+            init_status,
+        )
+        preloaded_dense_resources = load_dense_resources(
+            max_docs=max_docs,
+            rebuild_index=rebuild_index,
+            dense_text_mode=dense_text_mode,
+            dense_device=dense_device,
+            dense_batch_size=32,
+            model_offline=model_offline,
+        )
+        log_app_init(
+            f"Dense resources ready: {len(preloaded_dense_resources['dense_docnos'])} vectors loaded.",
+            init_status,
+        )
+
+    preloaded_reranker = None
+    if retrieval_mode == "Reranked":
+        log_app_init("Loading cross-encoder reranker model.", init_status)
+        preloaded_reranker = load_reranker(rerank_device, model_offline)
+        log_app_init("Reranker ready.", init_status)
+
+    log_app_init("Backend initialization complete.", init_status)
+    init_status.update(label="Backend resources ready.", state="complete", expanded=False)
+
+query_loader_resources = preloaded_bm25_resources
 
 query_source = st.radio("Query source", ["Custom query", "Existing TREC query"], horizontal=True)
 
@@ -552,30 +772,34 @@ if run_search:
     progress_callback = make_progress_callback(progress_bar, status_box, details_box, active_stage_box)
     backend.set_progress_callback(progress_callback)
     try:
-        update_progress(progress_bar, status_box, 1, f"0/{len(stage_plan)} - Starting search workflow...")
+        update_progress(progress_bar, status_box, 1, f"0/{len(stage_plan)} - Starting search...")
         details_box.caption(f"Mode: {retrieval_mode}")
-        render_active_stage(active_stage_box, "Loading BM25 resources")
+        render_active_stage(
+            active_stage_box,
+            "Loading BM25 documents, qrels, and index",
+            "rebuilding index if the checkbox is enabled",
+        )
 
-        bm25_resources = load_bm25_resources(max_docs=max_docs, rebuild_index=rebuild_index)
-        advance_stage("Load BM25 resources", f"{len(bm25_resources['docs_df'])} documents ready")
+        bm25_resources = preloaded_bm25_resources
+        bm25_retriever = preloaded_bm25_retriever
+        advance_stage("BM25 preparation", f"{len(bm25_resources['docs_df'])} documents and BM25 index ready")
 
         render_active_stage(active_stage_box, "Running BM25 retrieval", f"top_k={top_k}")
-        bm25_results = search_bm25(bm25_resources["index_ref"], query_text, top_k)
+        bm25_results = search_bm25(bm25_retriever, query_text)
         final_results = bm25_results
         dense_results = None
         fused_results = None
-        advance_stage("Run BM25 retrieval", f"{len(bm25_results)} rows returned")
+        step_results: dict[str, pd.DataFrame] = {"BM25": bm25_results}
+        advance_stage("BM25 ranking", f"{len(bm25_results)} rows returned")
 
         if retrieval_mode in {"Dense", "Fused", "Reranked"}:
-            render_active_stage(active_stage_box, "Loading dense resources", f"text mode={dense_text_mode}")
-            dense_resources = load_dense_resources(
-                max_docs=max_docs,
-                dense_text_mode=dense_text_mode,
-                dense_device=dense_device,
-                dense_batch_size=32,
-                raw_docs=bm25_resources["raw_docs"],
+            render_active_stage(
+                active_stage_box,
+                "Loading dense model, embeddings, and FAISS index",
+                f"text mode={dense_text_mode}; uses cached embeddings when available",
             )
-            advance_stage("Load dense resources", f"{len(dense_resources['dense_docnos'])} vectors ready")
+            dense_resources = preloaded_dense_resources
+            advance_stage("Dense preparation", f"{len(dense_resources['dense_docnos'])} dense vectors ready")
 
             render_active_stage(active_stage_box, "Dense retrieval", f"top_k={top_k}")
             dense_results = search_dense(
@@ -586,11 +810,12 @@ if run_search:
                 top_k,
             )
             final_results = dense_results
-            advance_stage("Run dense retrieval", f"{len(dense_results)} rows returned")
+            step_results["Dense"] = dense_results
+            advance_stage("Dense ranking", f"{len(dense_results)} rows returned")
 
         if retrieval_mode in {"Fused", "Reranked"}:
             if tune_rrf and selected_qid is not None:
-                render_active_stage(active_stage_box, "Tuning weighted RRF", f"query={selected_qid}")
+                render_active_stage(active_stage_box, "Tuning weighted RRF for this TREC query", f"query={selected_qid}")
                 bm25_for_tuning = bm25_results.copy()
                 dense_for_tuning = dense_results.copy()
                 bm25_for_tuning["qid"] = selected_qid
@@ -603,7 +828,7 @@ if run_search:
                     top_k,
                 )
                 advance_stage(
-                    "Tune weighted RRF",
+                    "Fusing",
                     f"rrf_k={int(best_trial['rrf_k'])}, alpha_bm25={best_trial['alpha_bm25']:.1f}",
                 )
                 st.caption(
@@ -617,7 +842,7 @@ if run_search:
             else:
                 if tune_rrf and selected_qid is None:
                     st.info("RRF tuning requires an existing TREC query because qrels are needed.")
-                render_active_stage(active_stage_box, "Fusing results", f"rrf_k={rrf_k}, alpha_bm25={alpha_bm25:.1f}")
+                render_active_stage(active_stage_box, "Fusing BM25 and dense results", f"rrf_k={rrf_k}, alpha_bm25={alpha_bm25:.1f}")
                 fused_results = search_fused(
                     bm25_results,
                     dense_results,
@@ -625,14 +850,18 @@ if run_search:
                     rrf_k=rrf_k,
                     alpha_bm25=alpha_bm25,
                 )
-                advance_stage("Fuse results", f"{len(fused_results)} rows returned")
+                advance_stage("Fusing", f"{len(fused_results)} rows returned")
             final_results = fused_results
+            step_results["Fused"] = fused_results
 
         if retrieval_mode == "Reranked":
-            render_active_stage(active_stage_box, "Loading reranker", rerank_device)
-            reranker = load_reranker(rerank_device)
-            advance_stage("Load reranker", "model ready")
-            render_active_stage(active_stage_box, "Reranking", f"top_k={top_k}")
+            render_active_stage(active_stage_box, "Loading cross-encoder reranker", rerank_device)
+            reranker = preloaded_reranker
+            advance_stage("Reranking preparation", "cross-encoder model ready")
+            render_active_stage(active_stage_box, "Reranking fused candidates", f"top_k={top_k}")
+            rerank_query_id = selected_qid or (
+                "custom_" + hashlib.sha1(backend.normalize_query_text(query_text).encode("utf-8")).hexdigest()[:12]
+            )
             final_results = search_reranked(
                 fused_results,
                 reranker,
@@ -640,8 +869,10 @@ if run_search:
                 bm25_resources["raw_docs"],
                 query_text,
                 top_k=top_k,
+                query_id=rerank_query_id,
             )
-            advance_stage("Run reranking", f"{len(final_results)} rows returned")
+            step_results["Reranked"] = final_results
+            advance_stage("Reranking", f"{len(final_results)} rows returned")
 
         render_active_stage(active_stage_box, "Finalizing results", retrieval_mode)
         advance_stage("Finalize results", f"displaying {len(final_results)} results for {retrieval_mode}")
@@ -662,6 +893,8 @@ if run_search:
 
     if selected_qid is not None:
         st.caption(f"Showing results for TREC query `{selected_qid}`")
+        relevance_by_docno = bm25_resources["qrels"].get(selected_qid, {})
+        render_step_rankings(step_results, bm25_resources["raw_docs"], relevance_by_docno)
 
     st.dataframe(
         display_df,
@@ -704,49 +937,117 @@ if run_evaluation:
 
     backend.set_progress_callback(progress_callback)
     try:
-        update_progress(progress_bar, status_box, 1, f"0/{len(stage_plan)} - Starting evaluation workflow...")
-        render_active_stage(active_stage_box, "Loading BM25 resources")
-        bm25_resources = load_bm25_resources(max_docs=max_docs, rebuild_index=rebuild_index)
-        advance_stage("Load BM25 resources", f"{len(bm25_resources['docs_df'])} documents ready")
+        update_progress(progress_bar, status_box, 1, f"0/{len(stage_plan)} - Starting evaluation...")
+        render_active_stage(
+            active_stage_box,
+            "Loading BM25 documents, qrels, and index",
+            "rebuilding index if the checkbox is enabled",
+        )
+        bm25_resources = preloaded_bm25_resources
+        advance_stage("BM25 preparation", f"{len(bm25_resources['docs_df'])} documents and BM25 index ready")
+
+        queries_df = bm25_resources["queries_df"]
+        thresholded_qrels = backend.build_thresholded_qrels(bm25_resources["qrels"])
+        result_sets: dict[str, pd.DataFrame] = {}
+        eval_run_info: dict[str, Any] = {
+            "retrieval_mode": retrieval_mode,
+            "top_k": top_k,
+            "tune_rrf": tune_rrf,
+            "rrf_k": rrf_k,
+            "alpha_bm25": alpha_bm25,
+            "alpha_dense": 1.0 - alpha_bm25,
+            "rrf_source": "manual",
+        }
+
+        render_active_stage(active_stage_box, "BM25 ranking", f"{len(queries_df)} queries, top_k={top_k}")
+        bm25_queries_df = queries_df.copy()
+        bm25_queries_df["query"] = bm25_queries_df["query"].apply(backend.normalize_query_text)
+        bm25_results = preloaded_bm25_retriever.transform(bm25_queries_df)
+        bm25_results = bm25_results.sort_values(["qid", "rank"]).reset_index(drop=True)
+        result_sets["BM25"] = bm25_results
+        final_results = bm25_results
+        advance_stage("BM25 ranking", f"{len(bm25_results)} rows returned")
 
         dense_resources = None
+        dense_results = None
         if retrieval_mode in {"Dense", "Fused", "Reranked"}:
-            render_active_stage(active_stage_box, "Loading dense resources", f"text mode={dense_text_mode}")
-            dense_resources = load_dense_resources(
-                max_docs=max_docs,
-                dense_text_mode=dense_text_mode,
-                dense_device=dense_device,
-                dense_batch_size=32,
-                raw_docs=bm25_resources["raw_docs"],
+            render_active_stage(
+                active_stage_box,
+                "Loading dense model, embeddings, and FAISS index",
+                f"text mode={dense_text_mode}; uses cached embeddings when available",
             )
-            advance_stage("Load dense resources", f"{len(dense_resources['dense_docnos'])} vectors ready")
+            dense_resources = preloaded_dense_resources
+            advance_stage("Dense preparation", f"{len(dense_resources['dense_docnos'])} dense vectors ready")
 
-        reranker = None
+            render_active_stage(active_stage_box, "Dense ranking", f"{len(queries_df)} queries, top_k={top_k}")
+            dense_results = search_dense_all_queries(
+                dense_resources["dense_model"],
+                dense_resources["faiss_index"],
+                dense_resources["dense_docnos"],
+                queries_df,
+                top_k,
+            )
+            result_sets["Dense"] = dense_results
+            final_results = dense_results
+            advance_stage("Dense ranking", f"{len(dense_results)} rows returned")
+
+        if retrieval_mode in {"Fused", "Reranked"} and dense_results is not None:
+            fusion_detail = "tuning weighted RRF on rel>=1 qrels" if tune_rrf else f"rrf_k={rrf_k}, alpha_bm25={alpha_bm25:.2f}"
+            render_active_stage(active_stage_box, "Fusing BM25 and dense rankings", fusion_detail)
+            if tune_rrf:
+                final_results, best_trial, _ = backend.tune_weighted_rrf(
+                    bm25_results,
+                    dense_results,
+                    thresholded_qrels["rel>=1"],
+                    top_k,
+                )
+                eval_run_info.update(
+                    {
+                        "rrf_k": int(best_trial["rrf_k"]),
+                        "alpha_bm25": float(best_trial["alpha_bm25"]),
+                        "alpha_dense": float(best_trial["alpha_dense"]),
+                        "rrf_source": "tuned rel>=1 MRR",
+                    }
+                )
+            else:
+                final_results = search_fused(
+                    bm25_results,
+                    dense_results,
+                    top_k=top_k,
+                    rrf_k=rrf_k,
+                    alpha_bm25=alpha_bm25,
+                )
+            result_sets["Fused"] = final_results
+            advance_stage("Fusing", f"{len(final_results)} rows returned")
+
         if retrieval_mode == "Reranked":
-            render_active_stage(active_stage_box, "Loading reranker", rerank_device)
-            reranker = load_reranker(rerank_device)
-            advance_stage("Load reranker", "model ready")
+            render_active_stage(active_stage_box, "Loading cross-encoder reranker", rerank_device)
+            reranker = preloaded_reranker
+            advance_stage("Reranking preparation", "cross-encoder model ready")
 
-        if retrieval_mode in {"Fused", "Reranked"} and tune_rrf:
-            render_active_stage(active_stage_box, "Preparing weighted RRF tuning", "using rel>=1 qrels during evaluation")
-            advance_stage("Tune weighted RRF", "tuning runs inside evaluation")
+            render_active_stage(active_stage_box, "Reranking", f"{len(final_results)} candidates")
+            final_results = backend.rerank_candidates(
+                reranker,
+                final_results,
+                queries_df,
+                bm25_resources["docs_df"],
+                bm25_resources["raw_docs"],
+                RERANK_CACHE_PATH,
+                batch_size=8,
+                rerank_alpha=None,
+            )
+            final_results = final_results[final_results["rank"] <= top_k].copy()
+            result_sets["Reranked"] = final_results
+            advance_stage("Reranking", f"{len(final_results)} rows returned")
 
-        update_progress(progress_bar, status_box, min(95, int(((completed_stages[0] + 0.5) / len(stage_plan)) * 100)), f"{completed_stages[0]}/{len(stage_plan)} - Running evaluation")
-        details_box.caption(f"Evaluating mode: {retrieval_mode}")
-        render_active_stage(active_stage_box, "Running evaluation", f"mode={retrieval_mode}, top_k={top_k}")
-        _, eval_metrics, eval_run_info = run_full_evaluation(
-            retrieval_mode=retrieval_mode,
-            top_k=top_k,
-            bm25_resources=bm25_resources,
-            dense_resources=dense_resources,
-            rrf_k=rrf_k,
-            alpha_bm25=alpha_bm25,
-            tune_rrf=tune_rrf,
-            reranker=reranker,
-        )
-        advance_stage("Run evaluation", f"computed rel>=1 and rel>=2 metrics for {retrieval_mode}")
-        render_active_stage(active_stage_box, "Finalizing metrics", retrieval_mode)
-        advance_stage("Finalize metrics", f"finished evaluation for mode: {retrieval_mode}")
+        render_active_stage(active_stage_box, "Evaluations", "computing rel>=1 and rel>=2 metrics")
+        eval_metrics = {}
+        for system_name, results_df in result_sets.items():
+            eval_metrics[system_name] = {
+                "rel>=1": backend.evaluate_run(results_df, thresholded_qrels["rel>=1"], top_k),
+                "rel>=2": backend.evaluate_run(results_df, thresholded_qrels["rel>=2"], top_k),
+            }
+        advance_stage("Evaluations", f"computed metrics for {', '.join(result_sets)}")
         clear_active_stage(active_stage_box)
     finally:
         backend.set_progress_callback(None)

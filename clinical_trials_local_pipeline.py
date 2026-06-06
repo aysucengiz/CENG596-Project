@@ -15,6 +15,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent
 RUNTIME_ROOT = REPO_ROOT / "runtime"
+DEFAULT_HF_CACHE_DIR = RUNTIME_ROOT / "hf_cache"
+DEFAULT_LOCAL_MODEL_DIR = RUNTIME_ROOT / "models"
 
 import faiss
 import ir_datasets
@@ -142,6 +144,17 @@ def parse_args() -> argparse.Namespace:
         help="Directory for persistent dense embedding cache files.",
     )
     parser.add_argument(
+        "--hf-cache-dir",
+        type=Path,
+        default=DEFAULT_HF_CACHE_DIR,
+        help="Directory for Hugging Face and sentence-transformers model cache.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Load models from local cache only. Requires models to have been cached already.",
+    )
+    parser.add_argument(
         "--dense-model",
         type=str,
         default="NeuML/pubmedbert-base-embeddings",
@@ -231,6 +244,32 @@ def resolve_device(override: str | None, default_device: Any) -> Any:
     return override
 
 
+def configure_model_cache(cache_dir: Path, offline: bool = False) -> None:
+    cache_dir = cache_dir.resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(cache_dir)
+    os.environ["HF_HUB_CACHE"] = str(cache_dir / "hub")
+    os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(cache_dir / "sentence_transformers")
+    os.environ["TRANSFORMERS_CACHE"] = str(cache_dir / "transformers")
+    if offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    else:
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    log_info(f"Model cache directory set to {cache_dir}")
+    log_info(f"Model offline mode: {'enabled' if offline else 'disabled'}")
+
+
+def local_model_path(model_name: str, cache_dir: Path | None = None) -> Path:
+    base_dir = DEFAULT_LOCAL_MODEL_DIR
+    if cache_dir is not None:
+        resolved_cache_dir = cache_dir.resolve()
+        if resolved_cache_dir.name == "hf_cache":
+            base_dir = resolved_cache_dir.parent / "models"
+    return base_dir / safe_cache_name(model_name)
+
+
 def ensure_pyterrier() -> None:
     log_step("Initializing PyTerrier/Java")
     if not pt.java.started():
@@ -240,8 +279,10 @@ def ensure_pyterrier() -> None:
         log_info("PyTerrier Java backend already running")
 
 
-def normalize_query_text(text: str) -> str:
-    return " ".join(text.lower().split())
+def normalize_query_text(text: Any) -> str:
+    if text is None or pd.isna(text):
+        return ""
+    return " ".join(str(text).lower().split())
 
 
 def build_bm25_document_text(doc: Any) -> tuple[str, dict[str, str]]:
@@ -548,7 +589,7 @@ def evaluate_run(
             dcg += gain / math.log2(idx + 1)
 
         ideal_hits = min(total_relevant, k)
-        idcg = sum(1.0 / math.log2(i + 1) for i in range(2, ideal_hits + 2))
+        idcg = sum(1.0 / math.log2(i + 1) for i in range(1, ideal_hits + 1))
 
         precisions.append(hits / k if k else 0.0)
         recalls.append(hits / total_relevant if total_relevant else 0.0)
@@ -716,25 +757,135 @@ def run_bm25(index_ref: Any, queries_df: pd.DataFrame, top_k: int) -> pd.DataFra
     return results_df
 
 
-def load_dense_model(model_name: str, device: Any) -> Any:
+def load_dense_model(
+    model_name: str,
+    device: Any,
+    cache_dir: Path | None = None,
+    offline: bool = False,
+) -> Any:
     from sentence_transformers import SentenceTransformer
 
     log_step(f"Loading dense model: {model_name}")
-    model = SentenceTransformer(model_name)
+    resolved_cache_dir = cache_dir or DEFAULT_HF_CACHE_DIR
+    saved_model_dir = local_model_path(model_name, resolved_cache_dir)
+    configure_model_cache(resolved_cache_dir, offline=offline)
+    if saved_model_dir.exists():
+        log_info(f"Loading dense model from project-local folder: {saved_model_dir}")
+        model = SentenceTransformer(str(saved_model_dir))
+        model.to(device)
+        log_info("Dense model loaded")
+        return model
+
+    try:
+        model = SentenceTransformer(
+            model_name,
+            cache_folder=str(resolved_cache_dir / "sentence_transformers"),
+            local_files_only=offline,
+        )
+    except TypeError:
+        model = SentenceTransformer(
+            model_name,
+            cache_folder=str(resolved_cache_dir / "sentence_transformers"),
+        )
+    except OSError as exc:
+        if offline:
+            raise OSError(
+                f"Dense model '{model_name}' was not found in the project cache. "
+                f"Run once online, or place the model under {saved_model_dir}."
+            ) from exc
+        log_info("Project model cache miss; trying the machine's default Hugging Face cache")
+        os.environ.pop("HF_HOME", None)
+        os.environ.pop("HF_HUB_CACHE", None)
+        os.environ.pop("SENTENCE_TRANSFORMERS_HOME", None)
+        os.environ.pop("TRANSFORMERS_CACHE", None)
+        model = SentenceTransformer(model_name)
+
+    saved_model_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        model.save(str(saved_model_dir))
+        log_info(f"Saved dense model copy for offline use: {saved_model_dir}")
+    except Exception as exc:
+        log_info(f"Could not save dense model copy ({exc})")
     model.to(device)
     log_info("Dense model loaded")
     return model
 
 
-def load_reranker(model_name: str, device: Any) -> Any:
+def load_reranker(
+    model_name: str,
+    device: Any,
+    cache_dir: Path | None = None,
+    offline: bool = False,
+) -> Any:
     from sentence_transformers import CrossEncoder
 
     log_step(f"Loading reranker model: {model_name}")
+    resolved_cache_dir = cache_dir or DEFAULT_HF_CACHE_DIR
+    saved_model_dir = local_model_path(model_name, resolved_cache_dir)
+    configure_model_cache(resolved_cache_dir, offline=offline)
+    if saved_model_dir.exists():
+        log_info(f"Loading reranker model from project-local folder: {saved_model_dir}")
+        try:
+            reranker = CrossEncoder(str(saved_model_dir), device=device, max_length=512)
+        except TypeError:
+            reranker = CrossEncoder(str(saved_model_dir), max_length=512)
+            reranker.model.to(device)
+        log_info("Reranker model loaded")
+        return reranker
+
     try:
-        reranker = CrossEncoder(model_name, device=device, max_length=512)
-    except TypeError:
+        reranker = CrossEncoder(
+            model_name,
+            device=device,
+            max_length=512,
+            cache_folder=str(resolved_cache_dir / "sentence_transformers"),
+            local_files_only=offline,
+        )
+    except OSError as exc:
+        if offline:
+            raise OSError(
+                f"Reranker model '{model_name}' was not found in the project cache. "
+                f"Run once online, or place the model under {saved_model_dir}."
+            ) from exc
+        log_info("Project reranker cache miss; trying the machine's default Hugging Face cache")
+        os.environ.pop("HF_HOME", None)
+        os.environ.pop("HF_HUB_CACHE", None)
+        os.environ.pop("SENTENCE_TRANSFORMERS_HOME", None)
+        os.environ.pop("TRANSFORMERS_CACHE", None)
         reranker = CrossEncoder(model_name, max_length=512)
         reranker.model.to(device)
+    except TypeError:
+        try:
+            reranker = CrossEncoder(
+                model_name,
+                device=device,
+                max_length=512,
+                cache_folder=str(resolved_cache_dir / "sentence_transformers"),
+            )
+        except TypeError:
+            reranker = CrossEncoder(model_name, max_length=512)
+            reranker.model.to(device)
+        except OSError as exc:
+            if offline:
+                raise OSError(
+                    f"Reranker model '{model_name}' was not found in the project cache. "
+                    f"Run once online, or place the model under {saved_model_dir}."
+                ) from exc
+            log_info("Project reranker cache miss; trying the machine's default Hugging Face cache")
+            os.environ.pop("HF_HOME", None)
+            os.environ.pop("HF_HUB_CACHE", None)
+            os.environ.pop("SENTENCE_TRANSFORMERS_HOME", None)
+            os.environ.pop("TRANSFORMERS_CACHE", None)
+            reranker = CrossEncoder(model_name, max_length=512)
+            reranker.model.to(device)
+    else:
+        reranker.model.to(device)
+    saved_model_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        reranker.save(str(saved_model_dir))
+        log_info(f"Saved reranker model copy for offline use: {saved_model_dir}")
+    except Exception as exc:
+        log_info(f"Could not save reranker model copy ({exc})")
     log_info("Reranker model loaded")
     return reranker
 
@@ -1146,6 +1297,7 @@ def main() -> None:
     with progress.stage("Initialize runtime", "setting cache directories and search backends"):
         os.environ["IR_DATASETS_HOME"] = str(args.ir_datasets_home.resolve())
         log_info(f"IR_DATASETS_HOME set to {os.environ['IR_DATASETS_HOME']}")
+        configure_model_cache(args.hf_cache_dir, offline=args.offline)
         ensure_pyterrier()
 
         device, device_label = select_device()
@@ -1206,7 +1358,12 @@ def main() -> None:
             log_info(f"Prepared dense documents: {len(dense_doc_df)}")
 
         with progress.stage("Load dense model", args.dense_model):
-            dense_model = load_dense_model(args.dense_model, device=dense_device)
+            dense_model = load_dense_model(
+                args.dense_model,
+                device=dense_device,
+                cache_dir=args.hf_cache_dir,
+                offline=args.offline,
+            )
 
         with progress.stage("Run dense retrieval", f"top_k={args.top_k}, batch_size={args.dense_batch_size}"):
             dense_results_df = run_dense_retrieval(
@@ -1261,7 +1418,12 @@ def main() -> None:
         safe_reranker_name = safe_cache_name(args.reranker_model)
         rerank_cache_path = output_dir / f"rerank_scores_{safe_reranker_name}_{RERANK_CACHE_VERSION}.parquet"
         with progress.stage("Load reranker", args.reranker_model):
-            reranker = load_reranker(args.reranker_model, device=rerank_device)
+            reranker = load_reranker(
+                args.reranker_model,
+                device=rerank_device,
+                cache_dir=args.hf_cache_dir,
+                offline=args.offline,
+            )
         with progress.stage("Run reranking", f"batch_size={args.rerank_batch_size}, cache={rerank_cache_path.name}"):
             reranked_df = rerank_candidates(
                 reranker,
